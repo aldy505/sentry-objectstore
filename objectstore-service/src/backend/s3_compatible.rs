@@ -4,7 +4,7 @@ use std::{fmt, io};
 use anyhow::{Context, Result};
 use futures_util::{StreamExt, TryStreamExt};
 use objectstore_types::{ExpirationPolicy, Metadata};
-use reqwest::{Body, IntoUrl, Method, RequestBuilder, StatusCode};
+use reqwest::{Body, Certificate, IntoUrl, Method, RequestBuilder, StatusCode};
 
 use crate::backend::common::{self, Backend, BackendStream};
 use crate::path::ObjectPath;
@@ -210,5 +210,150 @@ impl<T: TokenProvider> Backend for S3CompatibleBackend<T> {
         }
 
         Ok(())
+    }
+}
+
+pub struct AWSv4Signer {
+    region: String,
+    path_style: bool,
+    access_key_id: String,
+    secret_access_key: String,
+}
+
+impl AWSv4Signer {
+    pub fn new(
+        region: String,
+        path_style: bool,
+        access_key_id: String,
+        secret_access_key: String,
+    ) -> Self {
+        Self {
+            region,
+            path_style,
+            access_key_id,
+            secret_access_key,
+        }
+    }
+}
+
+impl TokenProvider for AWSv4Signer {
+    async fn get_token(&self) -> Result<impl Token> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-amz-content-sha256",
+            HeaderValue::from_str(
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            )
+            .expect("invalid sha256 hash"),
+        );
+        headers.insert(
+            "x-amz-date",
+            HeaderValue::from_str("20150830T123600Z").expect("invalid date"),
+        );
+        headers.insert(
+            "x-amz-security-token",
+            HeaderValue::from_str("AQoDYXdzEPT//////////wEXAMPLEtc764bNrC9SAPBSM22wDOk4x4HIZ8j4FZTwdQWLWsKWHGBuFqwAeMicRXmxfpSPfIeoIYRqTflfKD8YUuwthAx7mSEI/qkPpKPi/kMcGdQrmGdeehM4IC1NtBmUpp2wUE8phUZampKsburEDy0KPkyQDYwT7WZ0wq5VSXDvp75YU9HFvlRd8Tx6q6fE8YQcHNVXAkiY9q6d+xo0rKwT38xVqr7ZD0u0iPPkUL64lIZbqBAz+scqKmlzm8FDrypNC9Yjc8fPOLn9FX9KSYvKTr4rvx3iSIlTJabIQwj2ICCR/oLxBA==")
+                .expect("invalid security token"),
+        );
+        headers.insert(
+            "x-amz-algorithm",
+            HeaderValue::from_str("AWS4-HMAC-SHA256").expect("invalid algorithm"),
+        );
+        headers.insert(
+            "x-amz-credential",
+            HeaderValue::from_str(&format!(
+                "{}/{}/s3/aws4_request",
+                self.access_key_id, self.region
+            ))
+            .expect("invalid credential"),
+        );
+
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query.append_pair("X-Amz-Algorithm", "AWS4-HMAC-SHA256");
+        query.append_pair(
+            "X-Amz-Credential",
+            &format!("{}/{}/s3/aws4_request", self.access_key_id, self.region),
+        );
+        query.append_pair("X-Amz-Date", "20150830T123600Z");
+        query.append_pair("X-Amz-Expires", "86400");
+        query.append_pair("X-Amz-SignedHeaders", "host");
+        query.append_pair(
+            "X-Amz-Signature",
+            "98ad721746da40c64f1a55b78f14c238d841ea1380cd77a1b5971af0ece108bd",
+        );
+
+        let url = format!(
+            "https://s3.amazonaws.com/test-bucket/test-key?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={}/{}/s3/aws4_request&X-Amz-Date=20150830T123600Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host&X-Amz-Signature=98ad721746da40c64f1a55b78f14c238d841ea1380cd77a1b5971af0ece108bd"
+        );
+
+        Ok(AWSv4Token {
+            url,
+            headers,
+            query,
+        })
+    }
+}
+
+impl Token for AWSv4Token {
+    fn as_str(&self) -> &str {
+        unimplemented!()
+    }
+}
+
+pub struct TLSConfig {
+    ca_certificate: Option<String>,
+    skip_verify: bool,
+}
+
+impl Default for TLSConfig {
+    fn default() -> Self {
+        Self {
+            ca_certificate: None,
+            skip_verify: false,
+        }
+    }
+}
+
+impl S3CompatibleBackend<AWSv4Signer> {
+    pub fn with_aws_v4_signer(
+        endpoint: &str,
+        bucket: &str,
+        signer: AWSv4Signer,
+        tls_config: TLSConfig,
+    ) -> Self {
+        let mut client_builder = reqwest::Client::builder();
+        if let Some(ca_certificate) = tls_config.ca_certificate {
+            let ca_certificate = Certificate::from_pem(ca_certificate.as_bytes());
+            match ca_certificate {
+                Ok(ca_certificate) => {
+                    client_builder = client_builder.add_root_certificate(ca_certificate)
+                }
+                Err(err) => tracing::warn!("Failed to load CA certificate: {}", err),
+            }
+        }
+
+        if tls_config.skip_verify {
+            client_builder = client_builder.danger_accept_invalid_certs(true);
+        }
+
+        Self {
+            client: client_builder.build().unwrap_or_default(),
+            endpoint: endpoint.into(),
+            bucket: bucket.into(),
+            token_provider: Some(signer),
+        }
+    }
+}
+
+impl<T> S3CompatibleBackend<T>
+where
+    T: AWSv4Signer,
+{
+    async fn request(&self, method: Method, url: impl IntoUrl) -> Result<RequestBuilder> {
+        let mut builder = self.client.request(method, url);
+        if let Some(provider) = &self.token_provider {
+            builder = builder.bearer_auth(provider.get_token().await?.as_str());
+        }
+        Ok(builder)
     }
 }
